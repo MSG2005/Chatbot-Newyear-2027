@@ -13,63 +13,192 @@ from fastapi.responses import PlainTextResponse
 app = FastAPI()
 logger = logging.getLogger("uvicorn.error")
 
+# Real values belong in Render → Environment.
 VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
-WHATSAPP_TOKEN = os.environ["WHATSAPP_TOKEN"]
+WHATSAPP_TOKEN = os.environ["WHATSAPP_TOKEN"].strip()
 PHONE_NUMBER_ID = os.environ["PHONE_NUMBER_ID"].strip()
 META_APP_SECRET = os.environ["META_APP_SECRET"]
 GRAPH_API_VERSION = os.environ["GRAPH_API_VERSION"].strip()
 
 WELCOME = (
-    "🎉 Happy New Year! Welcome to Digital Catalyst’s "
-    "New Year AI 2027.\n\n"
+    "🎉 Welcome to Digital Catalyst’s New Year AI 2027!\n\n"
     "Create a wish for someone special, roast a friend for fun, "
     "or see what your future self might say.\n\n"
-    "1. Personalized New Year Wish\n"
-    "2. Roast My Friend\n"
-    "3. 2027 Prediction\n"
-    "4. Emotional Message\n"
-    "5. Message From Future You\n\n"
-    "Reply with a number from 1 to 5."
+    "Choose an experience below."
 )
 
 QUESTIONS = [
     "🎁 Who is this wish for?\n\n"
-    "Enter their first name. Example: Priya",
+    "Type their first name. Example: Priya",
 
     "What is your relationship with them?\n\n"
-    "Example: Friend, sister, colleague, or partner",
+    "Type your answer. Example: friend, sister, colleague, or partner",
 
-    "Choose the tone:\n\n"
-    "1. Warm\n"
-    "2. Funny\n"
-    "3. Professional\n"
-    "4. Emotional",
+    "How should your wish sound?",
 
     "Share one happy memory or something you appreciate "
     "about them.\n\n"
-    "Example: You always encourage me.\n\n"
-    "Reply SKIP to leave this out.",
+    "Type your answer, or tap Skip.",
 ]
 
-FOOTER = (
-    "\n\nReply ANOTHER to create another wish, "
-    "or MENU to return to the main menu."
-)
+MENU_CHOICES = [
+    ("1", "Personalized Wish"),
+    ("2", "Roast My Friend"),
+    ("3", "2027 Prediction"),
+    ("4", "Emotional Message"),
+    ("5", "Future You"),
+]
 
-# Test storage only: resets when Render restarts or redeploys.
+TONE_CHOICES = [
+    ("1", "Warm"),
+    ("2", "Funny"),
+    ("3", "Professional"),
+    ("4", "Emotional"),
+    ("back", "Back"),
+    ("menu", "Main Menu"),
+]
+
+NAV_BUTTONS = [
+    ("back", "Back"),
+    ("menu", "Main Menu"),
+]
+
+RESULT_BUTTONS = [
+    ("another", "Create Another"),
+    ("menu", "Main Menu"),
+]
+
+# Temporary test storage.
+# Sessions reset when Render restarts or redeploys.
 sessions = {}
 seen_messages = OrderedDict()
 processing_lock = asyncio.Lock()
 
 SESSION_TTL = 30 * 60
 MAX_SESSIONS = 2000
+MAX_SEEN_MESSAGES = 5000
 
+
+# --------------------------------------------------
+# WhatsApp message builders
+# --------------------------------------------------
+
+def text_message(body):
+    return {
+        "type": "text",
+        "text": {
+            "preview_url": False,
+            "body": body,
+        },
+    }
+
+
+def list_message(body, button_label, choices):
+    return {
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": body},
+            "action": {
+                "button": button_label,
+                "sections": [
+                    {
+                        "title": "Choose an option",
+                        "rows": [
+                            {
+                                "id": choice_id,
+                                "title": title,
+                            }
+                            for choice_id, title in choices
+                        ],
+                    }
+                ],
+            },
+        },
+    }
+
+
+def button_message(body, choices):
+    return {
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body},
+            "action": {
+                "buttons": [
+                    {
+                        "type": "reply",
+                        "reply": {
+                            "id": choice_id,
+                            "title": title,
+                        },
+                    }
+                    for choice_id, title in choices
+                ],
+            },
+        },
+    }
+
+
+def menu_message(prefix=""):
+    return list_message(
+        prefix + WELCOME,
+        "Choose experience",
+        MENU_CHOICES,
+    )
+
+
+def question_message(index, prefix=""):
+    body = prefix + QUESTIONS[index]
+
+    if index == 2:
+        return list_message(
+            body,
+            "Choose tone",
+            TONE_CHOICES,
+        )
+
+    if index == 3:
+        return button_message(
+            body,
+            [
+                ("skip", "Skip"),
+                ("back", "Back"),
+                ("menu", "Main Menu"),
+            ],
+        )
+
+    return button_message(body, NAV_BUTTONS)
+
+
+def incoming_text(message):
+    """Read typed text or the ID of a selected button/list row."""
+    if message.get("type") == "text":
+        return message.get("text", {}).get("body", "").strip()
+
+    if message.get("type") == "interactive":
+        interactive = message.get("interactive", {})
+        reply_type = interactive.get("type")
+
+        if reply_type in {"button_reply", "list_reply"}:
+            return (
+                interactive.get(reply_type, {})
+                .get("id", "")
+                .strip()
+            )
+
+    return None
+
+
+# --------------------------------------------------
+# Health and webhook verification
+# --------------------------------------------------
 
 @app.api_route("/", methods=["GET", "HEAD"])
 async def health():
     return {
         "status": "ok",
-        "service": "WhatsApp personalized wish test",
+        "service": "WhatsApp wish test with buttons",
     }
 
 
@@ -91,10 +220,16 @@ async def verify_webhook(request: Request):
             detail="Verification failed",
         )
 
-    return PlainTextResponse(params.get("hub.challenge", ""))
+    return PlainTextResponse(
+        params.get("hub.challenge", "")
+    )
 
 
-async def send_text(recipient: str, body: str) -> bool:
+# --------------------------------------------------
+# Send a WhatsApp message
+# --------------------------------------------------
+
+async def send_message(recipient, content):
     url = (
         f"https://graph.facebook.com/{GRAPH_API_VERSION}/"
         f"{PHONE_NUMBER_ID}/messages"
@@ -110,17 +245,20 @@ async def send_text(recipient: str, body: str) -> bool:
                 json={
                     "messaging_product": "whatsapp",
                     "to": recipient,
-                    "type": "text",
-                    "text": {
-                        "preview_url": False,
-                        "body": body,
-                    },
+                    **content,
                 },
             )
 
         if response.is_error:
             try:
-                error = response.json().get("error", {})
+                data = response.json()
+                error = (
+                    data.get("error", {})
+                    if isinstance(data, dict)
+                    else {}
+                )
+                if not isinstance(error, dict):
+                    error = {}
             except ValueError:
                 error = {}
 
@@ -130,7 +268,10 @@ async def send_text(recipient: str, body: str) -> bool:
                 response.status_code,
                 error.get("code"),
                 error.get("error_subcode"),
-                error.get("message", "Non-JSON error response"),
+                error.get(
+                    "message",
+                    "No structured error message",
+                ),
             )
             return False
 
@@ -144,6 +285,10 @@ async def send_text(recipient: str, body: str) -> bool:
         return False
 
 
+# --------------------------------------------------
+# Session and wish generation
+# --------------------------------------------------
+
 def new_session():
     return {
         "step": "menu",
@@ -153,6 +298,7 @@ def new_session():
 
 
 def create_wish(answers):
+    """Template-based generation for this test."""
     name, relationship, tone, detail = answers
 
     openings = {
@@ -179,10 +325,14 @@ def create_wish(answers):
     }
 
     result = openings[tone]
-    result += f"\n\nI’m grateful to have you as my {relationship}."
+    result += (
+        f"\n\nI’m grateful to have you as my {relationship}."
+    )
 
     if detail:
-        result += f"\n\nSomething I appreciate about you:\n{detail}"
+        result += (
+            f"\n\nSomething I appreciate about you:\n{detail}"
+        )
 
     result += "\n\nHere’s to a wonderful 2027!"
     return result
@@ -193,18 +343,21 @@ def build_reply(text, current):
 
     if command == "stop":
         return (
-            "Your current session has been cleared. "
-            "Send HI whenever you want to start again.",
+            text_message(
+                "Your current test session has been cleared. "
+                "Send HI whenever you want to start again."
+            ),
             None,
         )
 
     if command in {"hi", "hello", "menu", "restart"}:
-        return WELCOME, new_session()
+        return menu_message(), new_session()
 
     if current is None:
         return (
-            "Your session has ended or has not started.\n\n"
-            + WELCOME,
+            menu_message(
+                "Let’s start a new session.\n\n"
+            ),
             new_session(),
         )
 
@@ -214,45 +367,57 @@ def build_reply(text, current):
         "updated": time.monotonic(),
     }
 
+    # Back removes the previous answer and asks it again.
     if command == "back":
-        if state["step"] == "wish":
-            if state["answers"]:
-                state["answers"].pop()
-                return QUESTIONS[len(state["answers"])], state
+        if state["step"] == "wish" and state["answers"]:
+            state["answers"].pop()
+            return (
+                question_message(len(state["answers"])),
+                state,
+            )
 
-            return WELCOME, new_session()
+        return menu_message(), new_session()
 
-        return WELCOME, new_session()
-
+    # Main menu selections.
     if state["step"] == "menu":
         if command == "1":
             state["step"] = "wish"
             state["answers"] = []
-            return (
-                QUESTIONS[0]
-                + "\n\nUse BACK to go back or MENU to restart.",
-                state,
-            )
+            return question_message(0), state
 
         if command in {"2", "3", "4", "5"}:
             return (
-                "This option is still being built.\n\n"
-                "Reply 1 to test Personalized New Year Wish, "
-                "or MENU to see all options.",
+                button_message(
+                    "This experience is still being built.\n\n"
+                    "You can test Personalized Wish now.",
+                    [
+                        ("1", "Personalized Wish"),
+                        ("menu", "Main Menu"),
+                    ],
+                ),
                 state,
             )
 
-        return "Please reply with a number from 1 to 5.", state
+        return (
+            menu_message(
+                "Please select an experience from the list.\n\n"
+            ),
+            state,
+        )
 
+    # Actions after completing a wish.
     if state["step"] == "done":
         if command == "another":
             state["step"] = "wish"
             state["answers"] = []
-            return QUESTIONS[0], state
+            return question_message(0), state
 
         return (
-            "Reply ANOTHER to create another wish, "
-            "or MENU to return to the main menu.",
+            button_message(
+                "Would you like to create another wish "
+                "or return to the main menu?",
+                RESULT_BUTTONS,
+            ),
             state,
         )
 
@@ -260,14 +425,24 @@ def build_reply(text, current):
 
     if index == 0:
         if len(text) > 60:
-            return "Please enter a first name under 60 characters.", state
+            return (
+                question_message(
+                    0,
+                    "Please keep the name to 60 characters "
+                    "or fewer.\n\n",
+                ),
+                state,
+            )
         answer = text
 
     elif index == 1:
         if len(text) > 80:
             return (
-                "Please enter a short relationship, "
-                "such as friend or colleague.",
+                question_message(
+                    1,
+                    "Please keep the relationship to "
+                    "80 characters or fewer.\n\n",
+                ),
                 state,
             )
         answer = text
@@ -283,44 +458,52 @@ def build_reply(text, current):
             "professional": "Professional",
             "emotional": "Emotional",
         }
+
         answer = tones.get(command)
 
         if answer is None:
-            return QUESTIONS[2], state
+            return (
+                question_message(
+                    2,
+                    "Please select a tone from the list.\n\n",
+                ),
+                state,
+            )
 
     else:
         if len(text) > 500:
             return (
-                "Please keep your memory or detail "
-                "under 500 characters, or reply SKIP.",
+                question_message(
+                    3,
+                    "Please keep your detail to "
+                    "500 characters or fewer.\n\n",
+                ),
                 state,
             )
+
         answer = "" if command == "skip" else text
 
     state["answers"].append(answer)
 
     if len(state["answers"]) < len(QUESTIONS):
-        return QUESTIONS[len(state["answers"])], state
+        return (
+            question_message(len(state["answers"])),
+            state,
+        )
 
     result = create_wish(state["answers"])
     state["step"] = "done"
 
-    return result + FOOTER, state
+    return button_message(result, RESULT_BUTTONS), state
 
+
+# --------------------------------------------------
+# Process incoming messages
+# --------------------------------------------------
 
 async def process_messages(messages):
-    # Serial processing keeps this single-process test consistent.
+    # Single-process test: serialize state changes.
     async with processing_lock:
-        now = time.monotonic()
-
-        expired = [
-            recipient
-            for recipient, state in sessions.items()
-            if now - state["updated"] > SESSION_TTL
-        ]
-        for recipient in expired:
-            sessions.pop(recipient, None)
-
         for message in messages:
             message_id = message.get("id")
             recipient = message.get("from")
@@ -331,45 +514,66 @@ async def process_messages(messages):
             if message_id in seen_messages:
                 continue
 
-            current = sessions.get(recipient)
+            now = time.monotonic()
 
-            if message.get("type") != "text":
-                reply = (
-                    "Please send a text reply for this test. "
-                    "Send MENU to see the options."
+            expired = [
+                key
+                for key, state in sessions.items()
+                if now - state["updated"] > SESSION_TTL
+            ]
+
+            for key in expired:
+                sessions.pop(key, None)
+
+            current = sessions.get(recipient)
+            text = incoming_text(message)
+
+            if text is None:
+                reply = button_message(
+                    "Please type your answer or use the "
+                    "buttons on the latest message.",
+                    [("menu", "Main Menu")],
                 )
                 updated = current
+
+            elif not text:
+                continue
+
             else:
-                text = message.get("text", {}).get("body", "").strip()
-
-                if not text:
-                    continue
-
                 reply, updated = build_reply(text, current)
 
-            sent = await send_text(recipient, reply)
+            sent = await send_message(recipient, reply)
 
             if not sent:
-                # Preserve the previous question if sending fails.
+                # Do not advance the conversation if sending fails.
                 continue
 
             if updated is None:
                 sessions.pop(recipient, None)
+
             else:
-                if recipient not in sessions and len(sessions) >= MAX_SESSIONS:
+                if (
+                    recipient not in sessions
+                    and len(sessions) >= MAX_SESSIONS
+                ):
                     oldest = min(
                         sessions,
                         key=lambda key: sessions[key]["updated"],
                     )
                     sessions.pop(oldest, None)
 
+                updated["updated"] = time.monotonic()
                 sessions[recipient] = updated
 
             seen_messages[message_id] = True
 
-            if len(seen_messages) > 5000:
+            if len(seen_messages) > MAX_SEEN_MESSAGES:
                 seen_messages.popitem(last=False)
 
+
+# --------------------------------------------------
+# Receive and validate Meta webhooks
+# --------------------------------------------------
 
 @app.post("/webhook")
 async def receive_webhook(
@@ -416,10 +620,16 @@ async def receive_webhook(
 
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
+            if change.get("field") != "messages":
+                continue
+
             value = change.get("value", {})
 
             incoming_phone_id = str(
-                value.get("metadata", {}).get("phone_number_id", "")
+                value.get("metadata", {}).get(
+                    "phone_number_id",
+                    "",
+                )
             )
 
             if incoming_phone_id != PHONE_NUMBER_ID:
@@ -428,6 +638,9 @@ async def receive_webhook(
             incoming.extend(value.get("messages", []))
 
     if incoming:
-        background_tasks.add_task(process_messages, incoming)
+        background_tasks.add_task(
+            process_messages,
+            incoming,
+        )
 
     return {"status": "received"}
