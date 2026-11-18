@@ -12,11 +12,11 @@ from fastapi.responses import PlainTextResponse
 app = FastAPI()
 logger = logging.getLogger("uvicorn.error")
 
-VERIFY_TOKEN = os.environ["1dc041882ad5edcca53fe911a35cd553"]
-WHATSAPP_TOKEN = os.environ["EAAUmZBCZAYHZAUBTN5o58iPUhHGvyKURNo7uj7RC69CfTGimtxqDWoWNhoAmqoGZBOVC3r4cy1oCUPkZBJ0BnUtVlaDbxzsBy9XMHoBe1LJlInG1Is502xft9b4TLYjN7JUOxlrdOfnYma9Y0MsP3ZCdXwVNE1z1rKqRTtS5llGMpaFkcZAFIZBovpNTYHfZAVEQmpgU80wvP70qESriqiAWT3dYlnTw7dhUxPdbMzHwLZCk4UUDoiJChBF4HfBFqdO4zs2ae5WQESEY1jZAQM3fMfp"]
-PHONE_NUMBER_ID = os.environ["1453439214520407"]
-META_APP_SECRET = os.environ["1e03c092db505c3ce92582c51150bc14"]
-GRAPH_API_VERSION = os.environ["1453439214520407"]
+VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
+WHATSAPP_TOKEN = os.environ["WHATSAPP_TOKEN"]
+PHONE_NUMBER_ID = os.environ["PHONE_NUMBER_ID"]
+META_APP_SECRET = os.environ["META_APP_SECRET"]
+GRAPH_API_VERSION = os.environ["GRAPH_API_VERSION"]
 
 WELCOME = (
     "🎉 Happy New Year! Welcome to Digital Catalyst’s "
