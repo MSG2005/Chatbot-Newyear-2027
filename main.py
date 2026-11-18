@@ -81,9 +81,13 @@ async def send_welcome(recipient: str):
             )
 
         if response.is_error:
+            error = response.json().get("error", {})
             logger.error(
-                "WhatsApp send failed. HTTP status %s",
+                "WhatsApp send failed: HTTP %s | code=%s | subcode=%s | message=%s",
                 response.status_code,
+                error.get("code"),
+                error.get("error_subcode"),
+                error.get("message"),
             )
         else:
             logger.info("WhatsApp welcome accepted by Meta.")
