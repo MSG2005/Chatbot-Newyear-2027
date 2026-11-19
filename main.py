@@ -33,6 +33,23 @@ WELCOME = (
     "Choose an experience below."
 )
 
+# Current Meta test number, NOT the phone-number ID.
+# Change this Render variable when connecting your live business number.
+BOT_WHATSAPP_NUMBER = os.environ.get(
+    "BOT_WHATSAPP_NUMBER", "15556424478"
+).strip()
+if not BOT_WHATSAPP_NUMBER.isascii() or not BOT_WHATSAPP_NUMBER.isdigit():
+    raise ValueError("BOT_WHATSAPP_NUMBER must contain digits and country code only")
+
+INVITE_MESSAGE = (
+    "🎉 Try Digital Catalyst’s New Year AI 2027!\n\n"
+    "Create a personalized wish, roast a friend, or read a fictional "
+    "message from your future self.\n\n"
+    "Tap the link and send Hi to start:\n"
+    f"https://wa.me/{BOT_WHATSAPP_NUMBER}?text=Hi\n\n"
+    "Forward this message to invite a friend."
+)
+
 def field(key, prompt, limit=300, choices=None, optional=False):
     return {"key": key, "prompt": prompt, "limit": limit,
             "choices": choices, "optional": optional}
@@ -103,6 +120,7 @@ NAV_BUTTONS = [
 RESULT_BUTTONS = [
     ("another", "Create Another"),
     ("menu", "Main Menu"),
+    ("share", "Share Invite"),
 ]
 
 # Temporary test storage.
@@ -463,6 +481,14 @@ async def build_reply(text, current):
         return menu_message("Please select an experience.\n\n"), state
 
     if state["step"] == "done":
+        if command == "share":
+            return (
+                button_message(
+                    INVITE_MESSAGE,
+                    [("another", "Create Another"), ("menu", "Main Menu")],
+                ),
+                state,
+            )
         if command == "another":
             state.update(step="collect", answers=[])
             return question_message(0, flow_id), state
@@ -484,7 +510,7 @@ async def build_reply(text, current):
             return question_message(index, flow_id, "Please use the latest question.\n\n"), state
         command = pieces[3]
         text = command
-    elif command.startswith("flow|") or command in {"another", "retry"}:
+    elif command.startswith("flow|") or command in {"another", "retry", "share"}:
         return question_message(index, flow_id, "Please answer the current question.\n\n"), state
 
     if item["choices"]:
