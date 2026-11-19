@@ -20,8 +20,8 @@ WHATSAPP_TOKEN = os.environ["WHATSAPP_TOKEN"].strip()
 PHONE_NUMBER_ID = os.environ["PHONE_NUMBER_ID"].strip()
 META_APP_SECRET = os.environ["META_APP_SECRET"]
 GRAPH_API_VERSION = os.environ["GRAPH_API_VERSION"].strip()
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"].strip()
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4.1-mini").strip()
+
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
 
 WELCOME = (
     "🎉 Welcome to Digital Catalyst’s New Year AI 2027!\n\n"
