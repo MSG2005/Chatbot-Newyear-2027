@@ -22,6 +22,9 @@ META_APP_SECRET = os.environ["META_APP_SECRET"]
 GRAPH_API_VERSION = os.environ["GRAPH_API_VERSION"].strip()
 
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+# API version is set here; no Render variable is required.
+GEMINI_API_VERSION = "v1beta"
 
 WELCOME = (
     "🎉 Welcome to Digital Catalyst’s New Year AI 2027!\n\n"
@@ -320,55 +323,83 @@ async def create_wish(answers):
         "personal_detail": detail,
     }, ensure_ascii=False)
 
+    url = (
+        "https://generativelanguage.googleapis.com/"
+        f"{GEMINI_API_VERSION}/models/{GEMINI_MODEL}:generateContent"
+    )
     try:
-        async with httpx.AsyncClient(timeout=35) as client:
+        async with httpx.AsyncClient(timeout=45) as client:
             response = await client.post(
-                "https://api.openai.com/v1/chat/completions",
+                url,
                 headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "x-goog-api-key": GEMINI_API_KEY,
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": OPENAI_MODEL,
-                    "store": False,
-                    "messages": [
-                        {"role": "system", "content": instructions},
-                        {"role": "user", "content": user_data},
-                    ],
-                    "max_completion_tokens": 350,
+                    "systemInstruction": {
+                        "parts": [{"text": instructions}],
+                    },
+                    "contents": [{
+                        "role": "user",
+                        "parts": [{"text": user_data}],
+                    }],
+                    "generationConfig": {
+                        "maxOutputTokens": 2048,
+                    },
                 },
             )
+
         if response.is_error:
             try:
-                error_code = response.json().get("error", {}).get("code")
+                error = response.json().get("error", {})
+                status = error.get("status", "UNKNOWN")
+                code = error.get("code", response.status_code)
             except (ValueError, AttributeError):
-                error_code = "unknown"
+                status = "UNKNOWN"
+                code = response.status_code
+            # Never log the API key, user answers, or raw response body.
             logger.error(
-                "AI generation failed: HTTP %s | code=%s",
-                response.status_code, error_code,
+                "Gemini generation failed: HTTP %s | code=%s | status=%s",
+                response.status_code, code, status,
             )
             return None
 
-        choice = response.json()["choices"][0]
-        if choice.get("finish_reason") != "stop":
-            logger.warning("AI response was incomplete or unavailable.")
+        data = response.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            logger.warning("Gemini returned no candidate; content may be blocked.")
             return None
-        result = choice["message"].get("content")
-        if not isinstance(result, str) or not result.strip():
-            logger.warning("AI returned no usable wish.")
+
+        candidate = candidates[0]
+        if candidate.get("finishReason") != "STOP":
+            logger.warning(
+                "Gemini response incomplete or blocked: finish_reason=%s",
+                candidate.get("finishReason", "UNKNOWN"),
+            )
             return None
-        result = result.strip()
-        # Conservative UTF-16 length check for interactive message bodies.
+
+        parts = candidate.get("content", {}).get("parts", [])
+        result = "".join(
+            part.get("text", "")
+            for part in parts
+            if isinstance(part, dict)
+            and not part.get("thought", False)
+            and isinstance(part.get("text", ""), str)
+        ).strip()
+        if not result:
+            logger.warning("Gemini returned no usable wish.")
+            return None
         if len(result.encode("utf-16-le")) // 2 > 1024:
-            logger.warning("AI wish exceeded the message length limit.")
+            logger.warning("Gemini wish exceeded the message length limit.")
             return None
-        logger.info("AI wish generated successfully.")
+
+        logger.info("Gemini wish generated successfully.")
         return result
     except httpx.HTTPError:
-        logger.error("AI connection failed or timed out.")
+        logger.error("Gemini connection failed or timed out.")
         return None
     except (ValueError, KeyError, IndexError, TypeError, AttributeError):
-        logger.error("AI returned an unexpected response.")
+        logger.error("Gemini returned an unexpected response.")
         return None
 
 
