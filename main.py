@@ -1,4 +1,6 @@
 import asyncio
+import copy
+import re
 import hashlib
 import hmac
 import json
@@ -110,7 +112,7 @@ FLOWS = {
     },
 }
 
-MENU_CHOICES = [("flow|" + key, flow["title"]) for key, flow in FLOWS.items()]
+MENU_CHOICES = [("flow|" + key, flow["title"]) for key, flow in FLOWS.items()] + [("team", "Talk to Our Team")]
 
 NAV_BUTTONS = [
     ("back", "Back"),
@@ -120,7 +122,7 @@ NAV_BUTTONS = [
 RESULT_BUTTONS = [
     ("another", "Create Another"),
     ("menu", "Main Menu"),
-    ("share", "Share Invite"),
+    ("more", "More Options"),
 ]
 
 # Temporary test storage.
@@ -453,6 +455,147 @@ async def generate_result(state):
     return button_message(result, RESULT_BUTTONS), state
 
 
+# Enquiry preview only. These answers never go to Gemini or a team inbox.
+TEAM_FIELDS = [
+    field("name", "What is your name?", 80),
+    field("business", "What is your business name?", 100),
+    field("email", "What is your work email?", 150),
+    field("service", "Which service do you need?", choices=[
+        "SEO", "Google Ads", "Meta Ads", "Website Development",
+        "Social Media", "AI Automation", "Other",
+    ]),
+    field("goal", "What would you like to achieve?", 500),
+    field("website", "What is your website? Include https://, or tap Skip.", 200, optional=True),
+    field("city", "Which city are you based in? Type it or tap Skip.", 80, optional=True),
+]
+
+
+def more_message():
+    return button_message("What would you like to do next?", [
+        ("share", "Share Invite"), ("team", "Talk to Our Team"),
+        ("menu", "Main Menu"),
+    ])
+
+
+def team_consent():
+    return button_message(
+        "👋 Let’s talk about your business.\n\n"
+        "TEST PREVIEW: We’ll collect your details to test the enquiry flow. "
+        "They stay only in this temporary session, expire after inactivity, "
+        "and are not sent to our team or Gemini. Use sample details.\n\n"
+        "Would you like to continue?",
+        [("team_continue", "Continue"), ("menu", "Main Menu")],
+    )
+
+
+def team_question(state, prefix=""):
+    index = state["lead_index"]
+    item = TEAM_FIELDS[index]
+    body = prefix + item["prompt"]
+    if item["choices"]:
+        choices = [(f"lead|{index}|{i}", title)
+                   for i, title in enumerate(item["choices"], 1)]
+        return list_message(body, "Choose service", choices + NAV_BUTTONS)
+    buttons = list(NAV_BUTTONS)
+    if item["optional"]:
+        buttons.insert(0, (f"lead|{index}|skip", "Skip"))
+    return button_message(body, buttons)
+
+
+def team_review(state):
+    lead = state["lead"]
+    lines = ["Please check your test enquiry:"]
+    for item in TEAM_FIELDS:
+        value = lead.get(item["key"], "") or "Not provided"
+        # Compact the preview; retain complete answers in session.
+        if len(value) > 70:
+            value = value[:67] + "..."
+        lines.append(f"{item['key'].title()}: {value}")
+    lines.append(
+        "For the live enquiry, may our team contact you on this WhatsApp number? "
+        "Confirm Test records your answer only in this temporary test session. "
+        "No follow-up is arranged."
+    )
+    return button_message("\n\n".join(lines), [
+        ("team_confirm", "Confirm Test"), ("team_edit", "Edit"),
+        ("team_cancel", "Cancel"),
+    ])
+
+
+def handle_team(text, state):
+    command = text.casefold()
+    step = state["step"]
+    if command == "team_cancel":
+        state.pop("lead", None)
+        state.pop("lead_index", None)
+        state["step"] = "menu"
+        return menu_message("Test enquiry cancelled.\n\n"), state
+    if step == "team_consent":
+        if command != "team_continue":
+            return team_consent(), state
+        state.update(step="team_collect", lead={}, lead_index=0)
+        return team_question(state), state
+    if step == "team_complete":
+        return button_message(
+            "Your test is complete. Nothing was sent to the team. "
+            "Choose Main Menu to continue.", [("menu", "Main Menu")]
+        ), state
+    if step == "team_review":
+        if command == "team_confirm":
+            state["lead"]["contact_permission"] = True
+            state["step"] = "team_complete"
+            return button_message(
+                "✅ Test completed. Your answers are held only in this temporary "
+                "session. They have NOT been saved permanently or sent to our "
+                "team. We’ll connect storage and follow-up before launch.",
+                [("menu", "Main Menu")],
+            ), state
+        if command in {"team_edit", "back"}:
+            state.update(step="team_collect", lead_index=0)
+            return team_question(state, "Please review or re-enter each answer.\n\n"), state
+        return team_review(state), state
+    index = state["lead_index"]
+    item = TEAM_FIELDS[index]
+    if command == "back":
+        if index == 0:
+            state.update(step="team_consent", lead={})
+            return team_consent(), state
+        state["lead_index"] -= 1
+        return team_question(state), state
+    if command.startswith("lead|"):
+        parts = command.split("|")
+        if len(parts) != 3 or parts[1] != str(index):
+            return team_question(state, "Please use the latest question.\n\n"), state
+        command = parts[2]
+        text = command
+    elif command in {"more", "another", "share", "retry"} or command.startswith(("pick|", "flow|", "team_")):
+        return team_question(state), state
+    if item["choices"]:
+        options = {str(i): title for i, title in enumerate(item["choices"], 1)}
+        options.update({title.casefold(): title for title in item["choices"]})
+        value = options.get(command)
+        if value is None:
+            return team_question(state, "Please choose a listed service.\n\n"), state
+    elif command == "skip":
+        if not item["optional"]:
+            return team_question(state, "This answer is required.\n\n"), state
+        value = ""
+    else:
+        value = text.strip()
+        if not value or len(value) > item["limit"]:
+            return team_question(state, f"Enter 1–{item['limit']} characters.\n\n"), state
+        if item["key"] == "email" and not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", value):
+            return team_question(state, "Enter an email such as name@example.com.\n\n"), state
+        if item["key"] == "website" and not re.fullmatch(r"https?://[^\s/]+(?:/[^\s]*)?", value):
+            return team_question(state, "Include https:// or tap Skip.\n\n"), state
+    state["lead"][item["key"]] = value
+    state["lead_index"] += 1
+    if state["lead_index"] == len(TEAM_FIELDS):
+        state["step"] = "team_review"
+        return team_review(state), state
+    return team_question(state), state
+
+
 async def build_reply(text, current):
     command = text.casefold()
     if command == "stop":
@@ -464,7 +607,13 @@ async def build_reply(text, current):
     if current is None:
         return menu_message("Let’s start a new session.\n\n"), new_session()
 
-    state = {**current, "answers": list(current["answers"]), "updated": time.monotonic()}
+    state = copy.deepcopy(current)
+    state["updated"] = time.monotonic()
+    if command in {"team", "talk to our team"}:
+        state.update(step="team_consent", lead={}, lead_index=0)
+        return team_consent(), state
+    if state["step"].startswith("team_"):
+        return handle_team(text, state)
     flow_id = state.get("flow")
     if command == "back":
         if flow_id and state["step"] in {"collect", "retry"} and state["answers"]:
@@ -480,7 +629,10 @@ async def build_reply(text, current):
             return question_message(0, selected), state
         return menu_message("Please select an experience.\n\n"), state
 
-    if state["step"] == "done":
+    if state["step"] in {"done", "more"}:
+        if command == "more":
+            state["step"] = "more"
+            return more_message(), state
         if command == "share":
             return (
                 button_message(
@@ -510,7 +662,7 @@ async def build_reply(text, current):
             return question_message(index, flow_id, "Please use the latest question.\n\n"), state
         command = pieces[3]
         text = command
-    elif command.startswith("flow|") or command in {"another", "retry", "share"}:
+    elif command.startswith("flow|") or command in {"another", "retry", "share", "more"} or command.startswith(("lead|", "team_")):
         return question_message(index, flow_id, "Please answer the current question.\n\n"), state
 
     if item["choices"]:
