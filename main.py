@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime, timezone
 import hashlib
 import hmac
+from html import escape
 import json
 import logging
 import os
@@ -32,6 +33,10 @@ GEMINI_API_VERSION = "v1beta"
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].strip().rstrip("/")
 SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"].strip()
+RESEND_API_KEY = os.environ["RESEND_API_KEY"].strip()
+ALERT_FROM_EMAIL = os.environ["ALERT_FROM_EMAIL"].strip()
+TEAM_ALERT_EMAIL = os.environ["TEAM_ALERT_EMAIL"].strip()
+
 CONSENT_VERSION = "enquiry-v1"
 CONSENT_TEXT = (
     "I agree that Digital Catalyst may save my enquiry details and WhatsApp "
@@ -86,6 +91,91 @@ async def save_enquiry(state, recipient):
         except (httpx.HTTPError, ValueError, AttributeError):
             logger.error("Supabase verification unavailable.")
     return False
+
+
+def alert_content(row):
+    fields = [
+        ("Name", row["name"]), ("Business", row["business_name"]),
+        ("WhatsApp", row["whatsapp_number"]), ("Email", row["email"]),
+        ("Service", row["service"]), ("Goal", row["business_goal"]),
+        ("Website", row.get("website") or "Not provided"),
+        ("City", row.get("city") or "Not provided"),
+        ("Status at submission", "New"), ("Contact permission", "Granted for this enquiry"),
+        ("Reference", row["submission_id"]),
+    ]
+    text = "New WhatsApp Enquiry\n\n" + "\n".join(f"{k}: {v}" for k, v in fields)
+    rows = "".join(
+        '<tr><th style="text-align:left;padding:10px;background:#eef8f7">'
+        + escape(k) + '</th><td style="padding:10px;white-space:pre-wrap">'
+        + escape(str(v)) + '</td></tr>' for k, v in fields
+    )
+    number = row["whatsapp_number"]
+    link = f"https://wa.me/{number}" if number.isascii() and number.isdigit() else ""
+    button = (f'<p><a style="display:inline-block;background:#00897b;color:white;'
+              f'padding:14px 22px;text-decoration:none;border-radius:6px" href="{link}">'
+              'Open WhatsApp Chat</a></p>') if link else ""
+    html = ('<div style="font-family:Arial,sans-serif;max-width:680px;margin:auto;color:#172b2a">'
+            '<div style="background:#00897b;color:white;padding:22px;font-size:24px">Digital Catalyst</div>'
+            '<div style="padding:24px;border:1px solid #ddd"><h1>New WhatsApp Enquiry</h1>'
+            '<p>An enquiry has been saved in your database.</p><table style="width:100%;border-collapse:collapse">'
+            + rows + '</table>' + button
+            + '<p>Review the enquiry and update its status in Supabase. '
+            'Opening WhatsApp does not update the database status.</p></div></div>')
+    return {"from": ALERT_FROM_EMAIL, "to": [TEAM_ALERT_EMAIL],
+            "subject": "New WhatsApp Enquiry — " + row["service"], "text": text, "html": html}
+
+
+async def notify_team(submission_id):
+    """One initial alert attempt per enquiry. No scheduled retry worker yet.
+
+    'accepted' means Resend accepted the message, not that it was delivered.
+    'sending' or 'unknown' after a crash/timeout requires checking Resend logs.
+    """
+    headers = {"apikey": SUPABASE_SECRET_KEY}
+    if not SUPABASE_SECRET_KEY.startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {SUPABASE_SECRET_KEY}"
+    endpoint = f"{SUPABASE_URL}/rest/v1/enquiries"
+    params = {"submission_id": f"eq.{submission_id}"}
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            # Atomic claim: prevent repeat clicks or duplicate webhooks sending twice.
+            claim = await client.patch(endpoint, headers={**headers, "Prefer": "return=representation"},
+                params={**params, "alert_status": "eq.pending", "alert_attempts": "eq.0"},
+                json={"alert_status": "sending", "alert_attempts": 1})
+            if claim.is_error:
+                logger.error("Email alert claim failed: HTTP %s", claim.status_code)
+                return
+            rows = claim.json()
+            if not isinstance(rows, list) or not rows:
+                return
+            row = rows[0]
+            status, email_id = "unknown", None
+            try:
+                result = await client.post("https://api.resend.com/emails", headers={
+                    "Authorization": f"Bearer {RESEND_API_KEY}",
+                    "Idempotency-Key": f"enquiry-alert/{submission_id}",
+                }, json=alert_content(row))
+                if result.is_error:
+                    # 5xx may be ambiguous; inspect provider logs before resending.
+                    status = "unknown" if result.status_code >= 500 else "failed"
+                    logger.error("Team email request failed: HTTP %s", result.status_code)
+                else:
+                    data = result.json()
+                    email_id = data.get("id") if isinstance(data, dict) else None
+                    if email_id:
+                        status = "accepted"
+                        logger.info("Team email accepted by Resend.")
+            except (httpx.HTTPError, ValueError, TypeError):
+                logger.error("Team email outcome unknown; inspect Resend logs.")
+            update = {"alert_status": status, "alert_email_id": email_id}
+            if status == "accepted":
+                # API acceptance timestamp; not a delivery/read receipt.
+                update["alert_sent_at"] = datetime.now(timezone.utc).isoformat()
+            saved = await client.patch(endpoint, headers=headers, params=params, json=update)
+            if saved.is_error:
+                logger.error("Email alert tracking update failed: HTTP %s", saved.status_code)
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError):
+        logger.error("Team alert unavailable; enquiry remains saved. Inspect alert status and Resend logs.")
 
 
 WELCOME = (
@@ -606,6 +696,7 @@ async def handle_team(text, state, recipient):
                     "Your answers are kept only for this temporary session.",
                     [("team_confirm", "Retry Save"), ("menu", "Main Menu")],
                 ), state
+            await notify_team(state["submission_id"])
             state["step"] = "team_complete"
             state.pop("lead", None)
             return button_message(
