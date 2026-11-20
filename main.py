@@ -1,6 +1,8 @@
 import asyncio
 import copy
 import re
+import uuid
+from datetime import datetime, timezone
 import hashlib
 import hmac
 import json
@@ -27,6 +29,64 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
 # API version is set here; no Render variable is required.
 GEMINI_API_VERSION = "v1beta"
+
+SUPABASE_URL = os.environ["SUPABASE_URL"].strip().rstrip("/")
+SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"].strip()
+CONSENT_VERSION = "enquiry-v1"
+CONSENT_TEXT = (
+    "I agree that Digital Catalyst may save my enquiry details and WhatsApp "
+    "number and contact me on WhatsApp or email about this enquiry."
+)
+
+async def save_enquiry(state, recipient):
+    """Insert once; confirm existence after insert or ambiguous network failure."""
+    if not recipient or not state.get("submission_id"):
+        return False
+    lead = state["lead"]
+    record = {
+        "submission_id": state["submission_id"],
+        "whatsapp_number": recipient,
+        "name": lead["name"], "business_name": lead["business"],
+        "email": lead["email"], "service": lead["service"],
+        "business_goal": lead["goal"],
+        "website": lead.get("website") or None,
+        "city": lead.get("city") or None,
+        "contact_permission": True,
+        "consent_text": CONSENT_TEXT, "consent_version": CONSENT_VERSION,
+        "consented_at": state["consented_at"],
+    }
+    headers = {"apikey": SUPABASE_SECRET_KEY}
+    # New sb_secret keys belong in apikey, never in a JWT Bearer header.
+    if not SUPABASE_SECRET_KEY.startswith("sb_secret_"):
+        headers["Authorization"] = f"Bearer {SUPABASE_SECRET_KEY}"
+    endpoint = f"{SUPABASE_URL}/rest/v1/enquiries"
+    async with httpx.AsyncClient(timeout=15) as client:
+        try:
+            response = await client.post(
+                endpoint, params={"on_conflict": "submission_id"},
+                headers={**headers, "Prefer": "resolution=ignore-duplicates,return=minimal"},
+                json=record,
+            )
+            if response.is_error:
+                logger.error("Supabase insert failed: HTTP %s", response.status_code)
+        except httpx.HTTPError:
+            logger.error("Supabase insert connection error; checking submission.")
+        try:
+            response = await client.get(endpoint, headers=headers, params={
+                "select": "id", "submission_id": f"eq.{state['submission_id']}",
+                "whatsapp_number": f"eq.{recipient}", "limit": "1",
+            })
+            if response.is_error:
+                logger.error("Supabase verification failed: HTTP %s", response.status_code)
+                return False
+            rows = response.json()
+            if isinstance(rows, list) and len(rows) == 1 and rows[0].get("id"):
+                logger.info("Enquiry saved and verified in Supabase.")
+                return True
+        except (httpx.HTTPError, ValueError, AttributeError):
+            logger.error("Supabase verification unavailable.")
+    return False
+
 
 WELCOME = (
     "🎉 Welcome to Digital Catalyst’s New Year AI 2027!\n\n"
@@ -455,7 +515,7 @@ async def generate_result(state):
     return button_message(result, RESULT_BUTTONS), state
 
 
-# Enquiry preview only. These answers never go to Gemini or a team inbox.
+# Enquiry details go to Supabase only, never to Gemini. Team alerts are separate.
 TEAM_FIELDS = [
     field("name", "What is your name?", 80),
     field("business", "What is your business name?", 100),
@@ -480,9 +540,9 @@ def more_message():
 def team_consent():
     return button_message(
         "👋 Let’s talk about your business.\n\n"
-        "TEST PREVIEW: We’ll collect your details to test the enquiry flow. "
-        "They stay only in this temporary session, expire after inactivity, "
-        "and are not sent to our team or Gemini. Use sample details.\n\n"
+        "We’ll ask for your business details. On confirmation, Digital Catalyst "
+        "will save your enquiry and WhatsApp number and may contact you about it. "
+        "Your enquiry answers are not sent to Gemini. You can cancel before submitting.\n\n"
         "Would you like to continue?",
         [("team_continue", "Continue"), ("menu", "Main Menu")],
     )
@@ -504,32 +564,28 @@ def team_question(state, prefix=""):
 
 def team_review(state):
     lead = state["lead"]
-    lines = ["Please check your test enquiry:"]
+    lines = ["Please check your enquiry:"]
     for item in TEAM_FIELDS:
         value = lead.get(item["key"], "") or "Not provided"
         # Compact the preview; retain complete answers in session.
         if len(value) > 70:
             value = value[:67] + "..."
         lines.append(f"{item['key'].title()}: {value}")
-    lines.append(
-        "For the live enquiry, may our team contact you on this WhatsApp number? "
-        "Confirm Test records your answer only in this temporary test session. "
-        "No follow-up is arranged."
-    )
+    lines.append(CONSENT_TEXT + " Tap Submit to agree and save your enquiry.")
     return button_message("\n\n".join(lines), [
-        ("team_confirm", "Confirm Test"), ("team_edit", "Edit"),
+        ("team_confirm", "Submit"), ("team_edit", "Edit"),
         ("team_cancel", "Cancel"),
     ])
 
 
-def handle_team(text, state):
+async def handle_team(text, state, recipient):
     command = text.casefold()
     step = state["step"]
     if command == "team_cancel":
         state.pop("lead", None)
         state.pop("lead_index", None)
         state["step"] = "menu"
-        return menu_message("Test enquiry cancelled.\n\n"), state
+        return menu_message("Enquiry cancelled. No new submission will be made.\n\n"), state
     if step == "team_consent":
         if command != "team_continue":
             return team_consent(), state
@@ -537,20 +593,29 @@ def handle_team(text, state):
         return team_question(state), state
     if step == "team_complete":
         return button_message(
-            "Your test is complete. Nothing was sent to the team. "
+            "Your enquiry has been saved. "
             "Choose Main Menu to continue.", [("menu", "Main Menu")]
         ), state
     if step == "team_review":
         if command == "team_confirm":
-            state["lead"]["contact_permission"] = True
+            state.setdefault("consented_at", datetime.now(timezone.utc).isoformat())
+            if not await save_enquiry(state, recipient):
+                return button_message(
+                    "We couldn’t verify that your enquiry was saved. Tap Retry Save "
+                    "to check and try again without creating another copy. "
+                    "Your answers are kept only for this temporary session.",
+                    [("team_confirm", "Retry Save"), ("menu", "Main Menu")],
+                ), state
             state["step"] = "team_complete"
+            state.pop("lead", None)
             return button_message(
-                "✅ Test completed. Your answers are held only in this temporary "
-                "session. They have NOT been saved permanently or sent to our "
-                "team. We’ll connect storage and follow-up before launch.",
+                "✅ Your enquiry has been saved. Thank you! "
+                "This confirmation does not mean a team member has read it yet.",
                 [("menu", "Main Menu")],
             ), state
         if command in {"team_edit", "back"}:
+            if state.get("consented_at"):
+                return button_message("Please retry saving first, or return to Main Menu.", [("team_confirm", "Retry Save"), ("menu", "Main Menu")]), state
             state.update(step="team_collect", lead_index=0)
             return team_question(state, "Please review or re-enter each answer.\n\n"), state
         return team_review(state), state
@@ -592,15 +657,16 @@ def handle_team(text, state):
     state["lead_index"] += 1
     if state["lead_index"] == len(TEAM_FIELDS):
         state["step"] = "team_review"
+        state.setdefault("submission_id", str(uuid.uuid4()))
         return team_review(state), state
     return team_question(state), state
 
 
-async def build_reply(text, current):
+async def build_reply(text, current, recipient=None):
     command = text.casefold()
     if command == "stop":
         return text_message(
-            "Your current test session has been cleared. Send HI to start again."
+            "Your current session has been cleared. Previously submitted enquiries remain saved. Send HI to start again."
         ), None
     if command in {"hi", "hello", "menu", "restart"}:
         return menu_message(), new_session()
@@ -610,10 +676,12 @@ async def build_reply(text, current):
     state = copy.deepcopy(current)
     state["updated"] = time.monotonic()
     if command in {"team", "talk to our team"}:
+        state.pop("submission_id", None)
+        state.pop("consented_at", None)
         state.update(step="team_consent", lead={}, lead_index=0)
         return team_consent(), state
     if state["step"].startswith("team_"):
-        return handle_team(text, state)
+        return await handle_team(text, state, recipient)
     flow_id = state.get("flow")
     if command == "back":
         if flow_id and state["step"] in {"collect", "retry"} and state["answers"]:
@@ -729,7 +797,7 @@ async def process_messages(messages):
                 continue
 
             else:
-                reply, updated = await build_reply(text, current)
+                reply, updated = await build_reply(text, current, recipient)
 
             sent = await send_message(recipient, reply)
 
