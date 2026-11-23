@@ -63,31 +63,39 @@ def buttons(body, items):
             {'type': 'reply', 'reply': {'id': key, 'title': title}} for key, title in items]}}}
 
 
+INTRO = ('💛 Make someone you love feel special this New Year.\n\n'
+    'Create a personal wish just for them—and turn it into a beautiful greeting card to share.')
+
+
 def welcome():
+    descriptions = ['A warm wish for a fresh beginning', 'A little teasing, a lot of love',
+        'A fun, fictional look at their year', 'Say what they mean to you',
+        'An imaginary note from their future self']
     return {'type': 'interactive', 'interactive': {'type': 'list',
-        'body': {'text': '🎉 Create a personalised New Year greeting!\n\n'
-            'Choose an experience below. We save your selections and the recipient details '
-            'you provide. Only enter details you have permission to share and store. '
-            'The recipient’s name is used with Gemini to create the message; their number is not. '
-            'No message is sent to them automatically. Select an experience to agree, or send STOP.'},
-        'action': {'button': 'Choose Experience', 'sections': [{'title': 'New Year 2027',
-            'rows': [{'id': f'exp|{key}', 'title': label} for key, (label, _) in EXPERIENCES.items()]}]}}}
+        'body': {'text': '✨ Choose an experience, tell us who it’s for, and pick the feeling.\n\n'
+            'We’ll create the words. You’ll share the love.\n\n'
+            'We save your choices, your WhatsApp number, and the recipient’s name and number. '
+            'Only share details you have permission to save. Their name is used with Gemini to '
+            'create the wish; their number is not. Choose an experience to agree. Send STOP to cancel.'},
+        'action': {'button': 'Choose experience', 'sections': [{'title': 'Make it personal',
+            'rows': [{'id': f'exp|{key}', 'title': label, 'description': descriptions[int(key)-1]}
+                for key, (label, _) in EXPERIENCES.items()]}]}}}
 
 
 def choices(state):
-    return buttons(f"Choose the tone for {state['recipient_name']}’s message:",
+    return buttons(f"How should {state['recipient_name']}’s message feel? ✨",
         [(f'tone|{key}', label) for key, label in TONES.items()])
 
 
 def name_prompt(state):
-    return text_message(f"You chose {EXPERIENCES[state['flow']][0]}.\n\n"
-        "Who is this greeting for? Enter their first name.")
+    return text_message(f"🎉 {EXPERIENCES[state['flow']][0]} it is!\n\n"
+        "Who are we making this for? Send their first name.")
 
 
 def number_prompt(state):
-    return text_message(f"Enter {state['recipient_name']}’s WhatsApp number with country code "
-        "(example: +91 98765 43210). Only provide it if you have permission to share and store it. "
-        "You’ll forward the card yourself.")
+    return text_message(f"Let’s make something special for {state['recipient_name']} 💛\n\n"
+        "What’s their WhatsApp number? Include the country code, like +91 9876543210.\n\n"
+        "We’ll save it. You’ll forward the finished card yourself.")
 
 
 def valid_name(value):
@@ -149,8 +157,8 @@ async def checkpoint(candidate, sender):
     candidate['updated'] = time.monotonic()
     if not await save_progress(candidate, sender):
         pending = {'step': 'save_retry', 'pending': candidate, 'updated': time.monotonic()}
-        return [buttons('We couldn’t save this step. Your answer is kept for this session. Tap Retry.',
-            [('retry', 'Retry'), ('stop', 'Cancel')])], pending
+        return [buttons('We couldn’t save that answer. Tap Retry Save to continue.',
+            [('retry', 'Retry Save'), ('stop', 'Cancel')])], pending
     return await advance(candidate, sender)
 
 
@@ -168,16 +176,17 @@ async def advance(state, sender):
 
 async def generate_text(state, sender):
     if not state.get('greeting'):
+        await send_message(sender, text_message(f"✨ Creating something personal for {state['recipient_name']}…"))
         result = await generate_greeting(state['recipient_name'], state['flow'], state['tone'])
         if result is None:
             state['step'] = 'generating'
-            return [buttons('I couldn’t create the greeting right now. Tap Retry.',
+            return [buttons('Your wish couldn’t be created just now. Tap Retry to try again.',
                 [('retry', 'Retry'), ('stop', 'Cancel')])], state
         state['greeting'] = result
     state['step'] = 'text_ready'
     # Status failures never discard the generated text or trigger a new AI call.
     await save_progress(state, sender)
-    return [text_message(state['greeting'] + '\n\nReply /img to turn this into a greeting card.')], state
+    return [text_message(state['greeting'] + '\n\n🖼️ Send /img to turn this wish into your greeting card.')], state
 
 
 async def generate_greeting(name, flow, tone):
@@ -231,8 +240,9 @@ async def upload_card(data):
 async def make_card(state, sender):
     if not state.get('greeting'):
         return [text_message('Finish creating your greeting first, then send /img.')], state
+    await send_message(sender, text_message('🎨 Turning your wish into a card…'))
     try:
-        data = await asyncio.to_thread(render_card, state['greeting'], state['flow'], 0)
+        data = await asyncio.to_thread(render_card, state['greeting'], state['flow'], 0, state['recipient_name'])
     except (ValueError, OSError):
         logger.error('Card rendering failed.')
         return [buttons('The image couldn’t be prepared. Send /img or tap Retry.', [('retry', 'Retry')])], state
@@ -243,10 +253,10 @@ async def make_card(state, sender):
     await save_progress(state, sender)
     name = state['recipient_name']
     card = {'type': 'image', 'image': {'id': media_id, 'caption':
-        f'🎉 Your card for {name} is ready!\n'
-        f'Please share it with {name}: press and hold the image → Forward → choose their chat.\n\n'
+        f'Made for {name}, ready to make them smile 💛\n\n'
+        f'Use WhatsApp’s Forward option to send them this card.\n\n'
         f'Create your own greeting: {INVITE_URL}'}}
-    completion = text_message('✅ This session is complete. Reply HI to create another greeting.')
+    completion = text_message('Your card is ready to share! 🎉\n\nWant to make someone else smile? Send Hi to create another.')
     return [card, completion], state
 
 
@@ -255,7 +265,7 @@ async def reply_for(text, state, number):
     if command == 'stop':
         return [text_message('Session cancelled. Reply HI to start again. Previously saved details remain stored.')], None
     if command in {'hi', 'hello', 'menu', 'restart'} or state is None:
-        return [welcome()], {'step': 'experience', 'updated': time.monotonic()}
+        return [text_message(INTRO), welcome()], {'step': 'experience', 'updated': time.monotonic()}
     state = copy.deepcopy(state)
     state['updated'] = time.monotonic()
     if command in {'share', '/share'}:
@@ -299,7 +309,7 @@ async def reply_for(text, state, number):
         if command in {'/img', 'retry'}:
             return await make_card(state, number)
         return [text_message('Your greeting is ready. Reply /img to create the card, or HI to start again.')], state
-    return [text_message('This session is complete. Reply HI to create another greeting.')], state
+    return [text_message('Ready to make another card? Send Hi ✨')], state
 
 
 async def send_message(number, content):
