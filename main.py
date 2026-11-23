@@ -63,23 +63,61 @@ def buttons(body, items):
             {'type': 'reply', 'reply': {'id': key, 'title': title}} for key, title in items]}}}
 
 
-INTRO = ('💛 Make someone you love feel special this New Year.\n\n'
-    'Create a personal wish just for them—and turn it into a beautiful greeting card to share.')
+INTRO = (
+    "🎉 Happy New Year 2027! 🥳\n\n"
+    "Who deserves your first smile of the year? 💛\n\n"
+    "Create a personalised New Year wish for someone you love—and turn it "
+    "into a greeting card they’ll be happy to receive."
+)
+
+DATA_NOTICE = (
+    "Before you choose: we save your choices, your WhatsApp number, "
+    "and the recipient’s name and number. Only share details you have "
+    "permission to save.\n\n"
+    "Their name is used with Gemini to create the wish; their number is not. "
+    "You’ll forward the card yourself.\n\n"
+    "Choose an experience to agree, or send STOP to cancel."
+)
 
 
 def welcome():
-    descriptions = ['A warm wish for a fresh beginning', 'A little teasing, a lot of love',
-        'A fun, fictional look at their year', 'Say what they mean to you',
-        'An imaginary note from their future self']
-    return {'type': 'interactive', 'interactive': {'type': 'list',
-        'body': {'text': '✨ Choose an experience, tell us who it’s for, and pick the feeling.\n\n'
-            'We’ll create the words. You’ll share the love.\n\n'
-            'We save your choices, your WhatsApp number, and the recipient’s name and number. '
-            'Only share details you have permission to save. Their name is used with Gemini to '
-            'create the wish; their number is not. Choose an experience to agree. Send STOP to cancel.'},
-        'action': {'button': 'Choose experience', 'sections': [{'title': 'Make it personal',
-            'rows': [{'id': f'exp|{key}', 'title': label, 'description': descriptions[int(key)-1]}
-                for key, (label, _) in EXPERIENCES.items()]}]}}}
+    descriptions = [
+        "A warm wish for a fresh beginning",
+        "A little teasing, a lot of love",
+        "A fun, fictional look at their year",
+        "Say what they mean to you",
+        "An imaginary note from their future self",
+    ]
+
+    return {
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {
+                "text": (
+                    "✨ A heartfelt wish, a funny roast, or a little inspiration?\n\n"
+                    "Choose below. Tell us who it’s for, and we’ll create "
+                    "their New Year message and card—ready for you to share! 🎁"
+                )
+            },
+            "action": {
+                "button": "Create a Wish",
+                "sections": [
+                    {
+                        "title": "New Year 2027",
+                        "rows": [
+                            {
+                                "id": f"exp|{key}",
+                                "title": label,
+                                "description": descriptions[int(key) - 1],
+                            }
+                            for key, (label, _) in EXPERIENCES.items()
+                        ],
+                    }
+                ],
+            },
+        },
+    }
 
 
 def choices(state):
@@ -265,7 +303,14 @@ async def reply_for(text, state, number):
     if command == 'stop':
         return [text_message('Session cancelled. Reply HI to start again. Previously saved details remain stored.')], None
     if command in {'hi', 'hello', 'menu', 'restart'} or state is None:
-        return [text_message(INTRO), welcome()], {'step': 'experience', 'updated': time.monotonic()}
+        return [
+    text_message(INTRO),
+    welcome(),
+    text_message(DATA_NOTICE),
+], {
+    "step": "experience",
+    "updated": time.monotonic(),
+}
     state = copy.deepcopy(state)
     state['updated'] = time.monotonic()
     if command in {'share', '/share'}:
