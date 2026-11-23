@@ -39,7 +39,7 @@ def wrap(draw, text, face, width):
         if line.strip(): lines.append(line.rstrip())
     return lines
 
-def render_card(text, flow_id='1', variant=0):
+def render_card(text, flow_id='1', variant=0, recipient_name=''):
     text=card_text(text)
     if not text or len(text)>2200:
         raise ValueError('No usable greeting or greeting too long')
@@ -54,34 +54,32 @@ def render_card(text, flow_id='1', variant=0):
     accent={'1':'#1d584a','2':'#a73e1d','3':'#503279','4':'#964755','5':'#79502d'}[fid]
     titles={'1':'Happy New Year!','2':'New Year, Same You!','3':'Your 2027 Forecast','4':'From the Heart','5':'A Letter from Future You'}
     overlay=Image.new('RGBA',image.size,(0,0,0,0));o=ImageDraw.Draw(overlay)
-    if variant:
-        o.rounded_rectangle((78,403,1002,1127),radius=24,fill=accent+'ed',outline=accent,width=2)
-        ink='#fff9ed';secondary='#fff0d9'
-    else:
-        o.rounded_rectangle((78,403,1002,1127),radius=24,fill=(255,251,240,100),outline=accent+'45',width=2)
-        ink=accent;secondary=accent
+    # Opaque ink panel keeps variable-length greetings readable over every illustration.
+    o.rounded_rectangle((88,390,992,1145),radius=34,fill=accent+'ff')
+    o.rounded_rectangle((104,406,976,1129),radius=26,outline='#d9b76f',width=2)
     image=Image.alpha_composite(image,overlay);d=ImageDraw.Draw(image)
+    ink='#fff7e7';gold='#f0d697'
     def center(y,label,face,color):
         d.text(((1080-d.textlength(label,font=face))/2,y),label,font=face,fill=color)
-    title=titles[fid]
-    for heading_size in range(48,25,-1):
-        heading=font(heading_size,not variant)
-        if d.textlength(title,font=heading)<=830:break
-    center(428,title,heading,ink)
-    subtitle='NEW YEAR 2027' if fid not in {'3','5'} else 'NEW YEAR 2027 · FICTIONAL MESSAGE'
-    center(493,subtitle,font(20),secondary)
-    d.line((440,538,640,538),fill=secondary,width=2)
-    for size in range(36,13,-1):
-        face=font(size,not variant);lines=wrap(d,text,face,810)
-        step=math.ceil(size*1.4)
-        if len(lines)*step<=460:break
+    recipient = 'For ' + card_text(recipient_name) if recipient_name else 'MADE JUST FOR YOU'
+    for size in range(29,15,-1):
+        face=font(size)
+        if d.textlength(recipient,font=face)<=780:break
+    center(445,recipient,face,gold)
+    center(505,'Happy New Year',font(55,True),ink)
+    center(567,'2027',font(82,True),gold)
+    d.line((410,685,670,685),fill=gold,width=2)
+    for size in range(34,17,-1):
+        face=font(size,True);lines=wrap(d,text,face,750)
+        step=math.ceil(size*1.45)
+        if len(lines)*step<=290:break
     else:raise ValueError('Greeting does not fit the card')
-    top=572+(460-len(lines)*step)//2
+    top=720+(290-len(lines)*step)//2
     for line in lines:
-        if variant:
-            d.text((135,top),line,font=face,fill=ink)
-        else:center(top,line,face,ink)
+        center(top,line,face,ink)
         top+=step
-    center(1077,'DIGITAL CATALYST · NEW YEAR AI',font(17),secondary)
+    if fid in {'3','5'}:
+        center(1033,'AN IMAGINARY MESSAGE · JUST FOR FUN',font(16),gold)
+    center(1086,'Made with Digital Catalyst',font(19),gold)
     data=BytesIO();image.convert('RGB').save(data,format='JPEG',quality=90,optimize=True)
     return data.getvalue()
