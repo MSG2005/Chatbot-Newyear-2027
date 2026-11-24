@@ -93,13 +93,18 @@ def welcome():
         "type": "interactive",
         "interactive": {
             "type": "list",
-            "body": {
-                "text": (
-                    "✨ A heartfelt wish, a funny roast, or a little inspiration?\n\n"
-                    "Choose below. Tell us who it’s for, and we’ll create "
-                    "their New Year message and card—ready for you to share! 🎁"
-                )
-            },
+           "body": {
+    "text": (
+        "✨ A heartfelt wish, a funny roast, or a little inspiration?\n\n"
+        "Choose below. Tell us who it’s for, and we’ll create "
+        "their New Year message and card—ready for you to share! 🎁\n\n"
+        "We save your choices, your WhatsApp number, and their name "
+        "and number. Only share details you have permission to save. "
+        "Their name goes to Gemini to create the wish; their number "
+        "does not. You’ll forward the card yourself.\n\n"
+        "Choose an experience to agree, or send STOP to cancel."
+    )
+},
             "action": {
                 "button": "Create a Wish",
                 "sections": [
@@ -306,7 +311,6 @@ async def reply_for(text, state, number):
         return [
     text_message(INTRO),
     welcome(),
-    text_message(DATA_NOTICE),
 ], {
     "step": "experience",
     "updated": time.monotonic(),
