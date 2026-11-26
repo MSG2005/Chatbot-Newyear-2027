@@ -23,7 +23,7 @@ from greeting_card import render_card
 app = FastAPI()
 logger = logging.getLogger("uvicorn.error")
 
-# Set the real values in Render → Environment.
+# Keep real values in Render → Environment.
 VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
 WHATSAPP_TOKEN = os.environ["WHATSAPP_TOKEN"].strip()
 PHONE_NUMBER_ID = os.environ["PHONE_NUMBER_ID"].strip()
@@ -56,9 +56,10 @@ BOT_LINK = f"https://wa.me/{BOT_WHATSAPP_NUMBER}?text=Hi"
 
 SESSION_TTL = 1800
 MAX_SESSIONS = 2000
-CONSENT_VERSION = "greeting-flow-v3-auto-card"
+MAX_SEEN = 5000
+CONSENT_VERSION = "greeting-flow-v4-auto-tone"
 
-# Temporary state: run one server process/instance.
+# Temporary state: use one server process/instance.
 sessions = OrderedDict()
 seen = OrderedDict()
 pending_outbound = {}
@@ -109,6 +110,38 @@ EXPERIENCES = {
     ),
 }
 
+DATA_NOTICE = (
+    "We save your name, choices, WhatsApp number, and the recipient’s "
+    "name and number. Share only details you have permission to save. "
+    "Their name is sent to Gemini to create the wish; their number "
+    "is not. You’ll forward the card yourself.\n\n"
+    "Choose an option to agree, or send STOP to cancel."
+)
+
+
+def log_failure(context, exc):
+    """Log error type and location without logging personal details."""
+    traceback_node = exc.__traceback__
+
+    while traceback_node and traceback_node.tb_next:
+        traceback_node = traceback_node.tb_next
+
+    filename = "unknown"
+    line_number = "unknown"
+
+    if traceback_node:
+        filename = os.path.basename(
+            traceback_node.tb_frame.f_code.co_filename
+        )
+        line_number = traceback_node.tb_lineno
+
+    logger.error(
+        "%s: %s | file=%s | line=%s",
+        context,
+        type(exc).__name__,
+        filename,
+        line_number,
+    )
 
 
 def text_message(body):
@@ -170,7 +203,7 @@ def welcome():
                     "New Year wish and greeting card. 💛\n\n"
                     "Choose an option, tell us who it’s for, and we’ll "
                     "create a card ready to share! 🎁\n\n"
-                    
+                    + DATA_NOTICE
                 )
             },
             "action": {
@@ -193,22 +226,12 @@ def welcome():
     }
 
 
-def choices(state):
-    return buttons(
-        f"How should {state['recipient_name']}’s message feel? ✨",
-        [
-            (f"tone|{key}", label)
-            for key, label in TONES.items()
-        ],
-    )
-
-
 def name_prompt(state):
     if not state.get("sender_name"):
         return text_message(
             f"🎉 {EXPERIENCES[state['flow']][0]} it is!\n\n"
             "What’s your first name? "
-            "We’ll add it to your wish and card."
+            "We’ll add it to your card."
         )
 
     return text_message(
@@ -272,7 +295,6 @@ def incoming(message):
 
 
 def signed_greeting(state):
-    """Add the sender signature outside the AI-generated wording."""
     return (
         f"{state['greeting']}\n\n"
         f"From {state['sender_name']}"
@@ -280,7 +302,7 @@ def signed_greeting(state):
 
 
 async def save_progress(state, sender):
-    """Save checkpoints to the existing greeting_sessions table."""
+    """Save each checkpoint in the existing greeting_sessions table."""
     headers = {"apikey": SUPABASE_SECRET_KEY}
 
     if not SUPABASE_SECRET_KEY.startswith("sb_secret_"):
@@ -352,8 +374,8 @@ async def save_progress(state, sender):
         ValueError,
         AttributeError,
         TypeError,
-    ):
-        logger.error("Greeting database unavailable.")
+    ) as exc:
+        log_failure("Greeting database unavailable", exc)
 
     return False
 
@@ -363,12 +385,6 @@ async def checkpoint(candidate, sender):
     candidate["updated"] = time.monotonic()
 
     if not await save_progress(candidate, sender):
-        pending = {
-            "step": "save_retry",
-            "pending": candidate,
-            "updated": time.monotonic(),
-        }
-
         return [
             buttons(
                 "We couldn’t save that answer. "
@@ -378,7 +394,11 @@ async def checkpoint(candidate, sender):
                     ("stop", "Cancel"),
                 ],
             )
-        ], pending
+        ], {
+            "step": "save_retry",
+            "pending": candidate,
+            "updated": time.monotonic(),
+        }
 
     return await advance(candidate, sender)
 
@@ -390,9 +410,6 @@ async def advance(state, sender):
     if state["step"] == "number":
         return [number_prompt(state)], state
 
-    if state["step"] == "tone":
-        return [choices(state)], state
-
     if state["step"] == "generating":
         return await generate_text(state, sender)
 
@@ -400,7 +417,7 @@ async def advance(state, sender):
 
 
 async def generate_text(state, sender):
-    """Generate the wording internally, then create the card automatically."""
+    """Generate wording internally and automatically create the image."""
     if not state.get("greeting"):
         result = await generate_greeting(
             state["recipient_name"],
@@ -410,7 +427,6 @@ async def generate_text(state, sender):
 
         if result is None:
             state["step"] = "generating"
-
             return [
                 retry_card_message(
                     "Your card couldn’t be created just now. "
@@ -420,7 +436,7 @@ async def generate_text(state, sender):
 
         state["greeting"] = result
 
-    # Existing database status retained for image-generation retries.
+    # Retain the existing database status; no new schema is needed.
     state["step"] = "text_ready"
     await save_progress(state, sender)
 
@@ -456,11 +472,7 @@ async def generate_greeting(name, flow, tone):
                         {
                             "role": "user",
                             "parts": [
-                                {
-                                    "text": json.dumps(
-                                        {"name": name}
-                                    )
-                                }
+                                {"text": json.dumps({"name": name})}
                             ],
                         }
                     ],
@@ -505,8 +517,8 @@ async def generate_greeting(name, flow, tone):
         IndexError,
         TypeError,
         AttributeError,
-    ):
-        logger.error("Card generation unavailable.")
+    ) as exc:
+        log_failure("Card generation unavailable", exc)
         return None
 
 
@@ -546,19 +558,18 @@ async def upload_card(data):
         httpx.HTTPError,
         ValueError,
         AttributeError,
-    ):
-        logger.error("Card upload unavailable.")
+    ) as exc:
+        log_failure("Card upload unavailable", exc)
         return None
 
 
 async def make_card(state, sender):
-    """Return one image with its combined forwarding caption."""
     if not state.get("greeting"):
         state["step"] = "generating"
         return await generate_text(state, sender)
 
     try:
-        # greeting_card.py handles the background selection and signature.
+        # Compatible with your current renderer and its signature parser.
         data = await asyncio.to_thread(
             render_card,
             signed_greeting(state),
@@ -567,9 +578,8 @@ async def make_card(state, sender):
             state["recipient_name"],
         )
 
-    except (ValueError, OSError):
-        logger.error("Card rendering failed.")
-
+    except (ValueError, OSError, TypeError) as exc:
+        log_failure("Card rendering failed", exc)
         return [
             retry_card_message(
                 "Your card couldn’t be prepared. Tap Retry."
@@ -585,26 +595,26 @@ async def make_card(state, sender):
             )
         ], state
 
+    # Workflow status, not proof of delivery or forwarding.
     state["step"] = "complete"
     await save_progress(state, sender)
 
-    card = {
-        "type": "image",
-        "image": {
-            "id": media_id,
-            "caption": (
-                f"💛 From {state['sender_name']}, "
-                f"for {state['recipient_name']}—"
-                "a little New Year happiness to share!\n\n"
-                "Forward this card to your loved one.\n\n"
-                "Want to send a wish back or make another? "
-                f"Start here: {BOT_LINK}"
-            ),
-        },
-    }
-
-    # No separate greeting, progress or completion text.
-    return [card], state
+    return [
+        {
+            "type": "image",
+            "image": {
+                "id": media_id,
+                "caption": (
+                    f"💛 From {state['sender_name']}, "
+                    f"for {state['recipient_name']}—"
+                    "a little New Year happiness to share!\n\n"
+                    "Forward this card to your loved one.\n\n"
+                    "Want to send a wish back or make another? "
+                    f"Start here: {BOT_LINK}"
+                ),
+            },
+        }
+    ], state
 
 
 async def reply_for(text, state, number):
@@ -613,13 +623,12 @@ async def reply_for(text, state, number):
     if command == "stop":
         return [
             text_message(
-                "Session cancelled. Reply HI to start again. "
+                "Session cancelled. Send Hi to start again. "
                 "Previously saved details remain stored."
             )
         ], None
 
     if command in {"hi", "hello", "menu", "restart"} or state is None:
-        # One starting message, including the experience options.
         return [welcome()], {
             "step": "experience",
             "updated": time.monotonic(),
@@ -659,11 +668,10 @@ async def reply_for(text, state, number):
             return [welcome()], state
 
         state.update(
-            recipient_phone=phone,
-            tone=DEFAULT_TONES[state["flow"]],
-            step="generating",
+            session_id=str(uuid.uuid4()),
+            flow=selected,
+            step="name",
         )
-
         return await checkpoint(state, number)
 
     if step == "name":
@@ -692,31 +700,27 @@ async def reply_for(text, state, number):
         if not phone:
             return [
                 text_message(
-                    "Enter the number with country code, "
-                    "for example +91 98765 43210. "
-                    "We check its format, not whether it has "
-                    "a WhatsApp account."
+                    "Please include the country code, "
+                    "like +91 9876543210. "
+                    "We check the format, not whether "
+                    "the number has a WhatsApp account."
                 )
             ], state
 
+        # Assign the tone automatically and save it with the number.
         state.update(
             recipient_phone=phone,
-            step="tone",
-        )
-
-        return await checkpoint(state, number)
-
-    if step == "tone":
-        selected = command.removeprefix("tone|")
-
-        if selected not in TONES:
-            return [choices(state)], state
-
-        state.update(
-            tone=selected,
+            tone=DEFAULT_TONES[state["flow"]],
             step="generating",
         )
+        return await checkpoint(state, number)
 
+    # Compatibility for an older in-memory tone-stage session.
+    if step == "tone":
+        state.update(
+            tone=DEFAULT_TONES[state["flow"]],
+            step="generating",
+        )
         return await checkpoint(state, number)
 
     if step == "generating":
@@ -780,9 +784,17 @@ async def send_message(number, content):
         logger.info("WhatsApp reply accepted by Meta.")
         return True
 
-    except httpx.HTTPError:
-        logger.error("WhatsApp connection error.")
+    except httpx.HTTPError as exc:
+        log_failure("WhatsApp connection error", exc)
         return False
+
+
+def mark_seen(message_id):
+    seen[message_id] = True
+    seen.move_to_end(message_id)
+
+    while len(seen) > MAX_SEEN:
+        seen.popitem(last=False)
 
 
 async def drain(record, number):
@@ -824,32 +836,44 @@ async def process_user(number, messages):
                 if not message_id:
                     continue
 
+                # Finish an existing pending reply before new input.
                 pending = pending_outbound.get(number)
 
                 if pending:
                     if not await drain(pending, number):
                         return
 
-                    seen[pending["message_id"]] = True
+                    mark_seen(pending["message_id"])
                     pending_outbound.pop(number, None)
 
                 if message_id in seen:
                     continue
 
-                value = incoming(message)
                 current = sessions.get(number)
+                value = incoming(message)
 
-                if value:
-                    responses, updated = await reply_for(
-                        value,
-                        current,
-                        number,
-                    )
-                else:
+                try:
+                    if value:
+                        responses, updated = await reply_for(
+                            value,
+                            current,
+                            number,
+                        )
+                    else:
+                        responses = [
+                            text_message(
+                                "Please type your answer or use "
+                                "the latest choices."
+                            )
+                        ]
+                        updated = current
+
+                except Exception as exc:
+                    log_failure("Message processing failed", exc)
                     responses = [
                         text_message(
-                            "Please type your answer or use "
-                            "the latest choices."
+                            "Something went wrong. "
+                            "Please send Hi to start again."
                         )
                     ]
                     updated = current
@@ -888,16 +912,10 @@ async def process_user(number, messages):
                     return
 
                 pending_outbound.pop(number, None)
-                seen[message_id] = True
+                mark_seen(message_id)
 
-                while len(seen) > 5000:
-                    seen.popitem(last=False)
-
-    except Exception:
-        # Do not expose personal details or secrets in logs.
-        logger.error(
-            "Message processing failed; check configuration and retry."
-        )
+    except Exception as exc:
+        log_failure("Message processing failed", exc)
 
     finally:
         if (
@@ -998,19 +1016,53 @@ async def receive_webhook(
 
     messages = []
 
-    for entry in payload.get("entry", []):
-        for change in entry.get("changes", []):
+    entries = payload.get("entry", [])
+
+    if not isinstance(entries, list):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid entries",
+        )
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        changes = entry.get("changes", [])
+
+        if not isinstance(changes, list):
+            continue
+
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+
             value = change.get("value", {})
 
+            if not isinstance(value, dict):
+                continue
+
+            metadata = value.get("metadata", {})
+
+            if not isinstance(metadata, dict):
+                continue
+
             incoming_phone_id = str(
-                value.get("metadata", {}).get("phone_number_id")
+                metadata.get("phone_number_id")
             )
 
             if (
                 change.get("field") == "messages"
                 and incoming_phone_id == PHONE_NUMBER_ID
             ):
-                messages.extend(value.get("messages", []))
+                incoming_messages = value.get("messages", [])
+
+                if isinstance(incoming_messages, list):
+                    messages.extend(
+                        message
+                        for message in incoming_messages
+                        if isinstance(message, dict)
+                    )
 
     if messages:
         background_tasks.add_task(
