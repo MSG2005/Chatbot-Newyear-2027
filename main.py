@@ -70,6 +70,14 @@ TONES = {
     "3": "Inspirational",
 }
 
+DEFAULT_TONES = {
+    "1": "1",  # New Year Wish → Heartfelt
+    "2": "2",  # Playful Roast → Funny
+    "3": "3",  # 2027 Prediction → Inspirational
+    "4": "1",  # Emotional Message → Heartfelt
+    "5": "3",  # Future You → Inspirational
+}
+
 EXPERIENCES = {
     "1": (
         "New Year Wish",
@@ -651,9 +659,9 @@ async def reply_for(text, state, number):
             return [welcome()], state
 
         state.update(
-            session_id=str(uuid.uuid4()),
-            flow=selected,
-            step="name",
+            recipient_phone=phone,
+            tone=DEFAULT_TONES[state["flow"]],
+            step="generating",
         )
 
         return await checkpoint(state, number)
