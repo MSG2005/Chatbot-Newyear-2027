@@ -174,7 +174,7 @@ def render_card(
 
     variant = int(variant) % 2
 
-        cards_dir = BASE_DIR / "assets" / "cards"
+    cards_dir = BASE_DIR / "assets" / "cards"
 
     backgrounds = sorted(
         cards_dir.glob(f"theme-{fid}-*.png")
