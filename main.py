@@ -101,13 +101,6 @@ EXPERIENCES = {
     ),
 }
 
-DATA_NOTICE = (
-    "We save your name, choices, WhatsApp number, and the recipient’s "
-    "name and number. Share only details you have permission to save. "
-    "Their name is sent to Gemini to create the wish; their number "
-    "is not. You’ll forward the card yourself.\n\n"
-    "Choose an option to agree, or send STOP to cancel."
-)
 
 
 def text_message(body):
@@ -169,7 +162,7 @@ def welcome():
                     "New Year wish and greeting card. 💛\n\n"
                     "Choose an option, tell us who it’s for, and we’ll "
                     "create a card ready to share! 🎁\n\n"
-                    + DATA_NOTICE
+                    
                 )
             },
             "action": {
