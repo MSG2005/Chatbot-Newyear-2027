@@ -1,4 +1,4 @@
-"""User-initiated greeting workflow. No outbound templates or email alerts."""
+"""User-initiated greeting cards. No templates or email alerts."""
 
 import asyncio
 import copy
@@ -39,25 +39,11 @@ GEMINI_MODEL = os.environ.get(
 SUPABASE_URL = os.environ["SUPABASE_URL"].strip().rstrip("/")
 SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"].strip()
 
-BOT_WHATSAPP_NUMBER = os.environ.get(
-    "BOT_WHATSAPP_NUMBER",
-    "15556424478",
-).strip()
-
-if (
-    not BOT_WHATSAPP_NUMBER.isascii()
-    or not BOT_WHATSAPP_NUMBER.isdigit()
-):
-    raise ValueError(
-        "BOT_WHATSAPP_NUMBER must contain country code and digits only"
-    )
-
-INVITE_URL = f"https://wa.me/{BOT_WHATSAPP_NUMBER}?text=Hi"
-
 SESSION_TTL = 1800
 MAX_SESSIONS = 2000
-CONSENT_VERSION = "greeting-flow-v2-sender-name"
+CONSENT_VERSION = "greeting-flow-v3-auto-card"
 
+# Temporary state for a single server process.
 sessions = OrderedDict()
 seen = OrderedDict()
 pending_outbound = {}
@@ -107,8 +93,13 @@ INTRO = (
     "into a greeting card they’ll be happy to receive."
 )
 
-
-
+DATA_NOTICE = (
+    "We save your name, choices, WhatsApp number, and the recipient’s "
+    "name and number. Share only details you have permission to save. "
+    "Their name is sent to Gemini to create the wish; their number "
+    "is not. You’ll forward the card yourself.\n\n"
+    "Choose an option to agree, or send STOP to cancel."
+)
 
 
 def text_message(body):
@@ -140,6 +131,16 @@ def buttons(body, items):
     }
 
 
+def retry_card_message(body):
+    return buttons(
+        body,
+        [
+            ("retry", "Retry"),
+            ("stop", "Cancel"),
+        ],
+    )
+
+
 def welcome():
     descriptions = [
         "A warm wish for a fresh beginning",
@@ -155,12 +156,10 @@ def welcome():
             "type": "list",
             "body": {
                 "text": (
-                    "✨ A heartfelt wish, a funny roast, "
-                    "or a little inspiration?\n\n"
-                    "Choose below. Tell us who it’s for, and we’ll create "
-                    "their New Year message and card—ready for you "
-                    "to share! 🎁\n\n"
-                    
+                    "✨ Create a New Year wish for someone special!\n\n"
+                    "Choose an option below. We’ll help you create "
+                    "a personal greeting card to share. 🎁\n\n"
+                    + DATA_NOTICE
                 )
             },
             "action": {
@@ -262,7 +261,7 @@ def incoming(message):
 
 
 def signed_greeting(state):
-    """Use the same greeting and sender signature in chat and card."""
+    """Add the sender signature outside the AI-generated wording."""
     return (
         f"{state['greeting']}\n\n"
         f"From {state['sender_name']}"
@@ -270,7 +269,7 @@ def signed_greeting(state):
 
 
 async def save_progress(state, sender):
-    """Save each checkpoint to the existing greeting_sessions table."""
+    """Save checkpoints to the existing greeting_sessions table."""
     headers = {"apikey": SUPABASE_SECRET_KEY}
 
     if not SUPABASE_SECRET_KEY.startswith("sb_secret_"):
@@ -295,12 +294,10 @@ async def save_progress(state, sender):
         if state.get(field):
             row[field] = state[field]
 
-    endpoint = f"{SUPABASE_URL}/rest/v1/greeting_sessions"
-
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             response = await client.post(
-                endpoint,
+                f"{SUPABASE_URL}/rest/v1/greeting_sessions",
                 params={"on_conflict": "id"},
                 headers={
                     **headers,
@@ -324,6 +321,7 @@ async def save_progress(state, sender):
         if (
             isinstance(rows, list)
             and len(rows) == 1
+            and isinstance(rows[0], dict)
             and all(
                 rows[0].get(key) == value
                 for key, value in row.items()
@@ -391,15 +389,8 @@ async def advance(state, sender):
 
 
 async def generate_text(state, sender):
+    """Generate the wording internally, then create the card automatically."""
     if not state.get("greeting"):
-        await send_message(
-            sender,
-            text_message(
-                "✨ Creating something personal for "
-                f"{state['recipient_name']}…"
-            ),
-        )
-
         result = await generate_greeting(
             state["recipient_name"],
             state["flow"],
@@ -410,32 +401,20 @@ async def generate_text(state, sender):
             state["step"] = "generating"
 
             return [
-                buttons(
-                    "Your wish couldn’t be created just now. "
-                    "Tap Retry to try again.",
-                    [
-                        ("retry", "Retry"),
-                        ("stop", "Cancel"),
-                    ],
+                retry_card_message(
+                    "Your card couldn’t be created just now. "
+                    "Tap Retry to try again."
                 )
             ], state
 
-        # Store only the generated greeting here.
-        # The sender signature is added separately.
         state["greeting"] = result
 
+    # Keep this existing database status for renderer/upload retries.
     state["step"] = "text_ready"
-
-    # A status-save failure must not discard the generated greeting.
     await save_progress(state, sender)
 
-    return [
-        text_message(
-            signed_greeting(state)
-            + "\n\n🖼️ Send /img to turn this wish "
-              "into your greeting card."
-        )
-    ], state
+    # No text greeting or progress message is sent.
+    return await make_card(state, sender)
 
 
 async def generate_greeting(name, flow, tone):
@@ -506,7 +485,7 @@ async def generate_greeting(name, flow, tone):
         ):
             return None
 
-        logger.info("Short card greeting generated successfully.")
+        logger.info("Card greeting generated successfully.")
         return result
 
     except (
@@ -563,21 +542,14 @@ async def upload_card(data):
 
 
 async def make_card(state, sender):
+    """Prepare one image response with its forwarding caption."""
     if not state.get("greeting"):
-        return [
-            text_message(
-                "Finish creating your greeting first, then send /img."
-            )
-        ], state
-
-    await send_message(
-        sender,
-        text_message("🎨 Turning your wish into a card…"),
-    )
+        state["step"] = "generating"
+        return await generate_text(state, sender)
 
     try:
-        # Compatible with the existing four-argument renderer.
-        # The same signed wording appears in chat and on the card.
+        # Compatible with the supplied greeting_card.py.
+        # Its signature parser places "From Name" beneath the greeting.
         data = await asyncio.to_thread(
             render_card,
             signed_greeting(state),
@@ -590,10 +562,8 @@ async def make_card(state, sender):
         logger.error("Card rendering failed.")
 
         return [
-            buttons(
-                "The image couldn’t be prepared. "
-                "Send /img or tap Retry.",
-                [("retry", "Retry")],
+            retry_card_message(
+                "Your card couldn’t be prepared. Tap Retry."
             )
         ], state
 
@@ -601,39 +571,29 @@ async def make_card(state, sender):
 
     if not media_id:
         return [
-            buttons(
-                "The image couldn’t be uploaded. "
-                "Send /img or tap Retry.",
-                [("retry", "Retry")],
+            retry_card_message(
+                "Your card couldn’t be uploaded just now. Tap Retry."
             )
         ], state
 
     state["step"] = "complete"
     await save_progress(state, sender)
 
-    recipient_name = state["recipient_name"]
-    sender_name = state["sender_name"]
-
+    # Exactly one image message; no separate completion text.
     card = {
         "type": "image",
         "image": {
             "id": media_id,
             "caption": (
-                f"From {sender_name}, made for {recipient_name} 💛\n\n"
-                "Use WhatsApp’s Forward option to send them "
-                "this card.\n\n"
-                f"Create your own greeting: {INVITE_URL}"
+                f"Made for {state['recipient_name']}, "
+                f"from {state['sender_name']} 💛\n\n"
+                "Use WhatsApp’s Forward option to send them this card.\n"
+                "Send Hi to create another."
             ),
         },
     }
 
-    completion = text_message(
-        "Your card is ready to share! 🎉\n\n"
-        "Want to make someone else smile? "
-        "Send Hi to create another."
-    )
-
-    return [card, completion], state
+    return [card], state
 
 
 async def reply_for(text, state, number):
@@ -648,7 +608,7 @@ async def reply_for(text, state, number):
         ], None
 
     if command in {"hi", "hello", "menu", "restart"} or state is None:
-        # Exactly TWO opening messages.
+        # Exactly two opening messages.
         return [
             text_message(INTRO),
             welcome(),
@@ -659,6 +619,7 @@ async def reply_for(text, state, number):
 
     state = copy.deepcopy(state)
     state["updated"] = time.monotonic()
+    step = state["step"]
 
     if command in {"share", "/share"}:
         return [
@@ -668,8 +629,6 @@ async def reply_for(text, state, number):
                 "On desktop, open the image message menu → Forward."
             )
         ], state
-
-    step = state["step"]
 
     if step == "save_retry":
         if command == "retry":
@@ -713,8 +672,8 @@ async def reply_for(text, state, number):
         if not state.get("sender_name"):
             state["sender_name"] = name
 
-            # Reuse the existing allowed database status.
-            # The next question asks for the recipient's name.
+            # Reuse the existing allowed status.
+            # The next question collects the recipient's name.
             state["step"] = "name"
 
             return await checkpoint(state, number)
@@ -755,6 +714,7 @@ async def reply_for(text, state, number):
             step="generating",
         )
 
+        # Successful saving leads directly to generation and the image.
         return await checkpoint(state, number)
 
     if step == "generating":
@@ -762,23 +722,18 @@ async def reply_for(text, state, number):
             return await generate_text(state, number)
 
         return [
-            buttons(
-                "Tap Retry to create your greeting.",
-                [
-                    ("retry", "Retry"),
-                    ("stop", "Cancel"),
-                ],
+            retry_card_message(
+                "Tap Retry to create your card."
             )
         ], state
 
     if step == "text_ready":
-        if command in {"/img", "retry"}:
+        if command == "retry":
             return await make_card(state, number)
 
         return [
-            text_message(
-                "Your greeting is ready. Reply /img to create "
-                "the card, or HI to start again."
+            retry_card_message(
+                "Your card is waiting to be created. Tap Retry."
             )
         ], state
 
@@ -867,7 +822,7 @@ async def process_user(number, messages):
                 if not message_id:
                     continue
 
-                # Finish pending replies before handling a new input.
+                # Retry an already-prepared response before new input.
                 pending = pending_outbound.get(number)
 
                 if pending:
@@ -938,7 +893,7 @@ async def process_user(number, messages):
                     seen.popitem(last=False)
 
     except Exception:
-        # Avoid exposing names, phone numbers or secrets in logs.
+        # Avoid exposing personal details or secrets in logs.
         logger.error(
             "Message processing failed; check configuration and retry."
         )
@@ -972,7 +927,7 @@ async def process_messages(messages):
 async def health():
     return {
         "status": "ok",
-        "service": "WhatsApp greeting experience",
+        "service": "WhatsApp automatic greeting cards",
     }
 
 
@@ -1045,6 +1000,7 @@ async def receive_webhook(
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
+
             incoming_phone_id = str(
                 value.get("metadata", {}).get("phone_number_id")
             )
