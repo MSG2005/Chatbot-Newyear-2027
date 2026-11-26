@@ -1,4 +1,4 @@
-"""User-initiated greeting cards. No templates or email alerts."""
+"""WhatsApp New Year greeting cards. User-initiated conversations only."""
 
 import asyncio
 import copy
@@ -23,7 +23,7 @@ from greeting_card import render_card
 app = FastAPI()
 logger = logging.getLogger("uvicorn.error")
 
-# Real values belong in Render → Environment.
+# Set the real values in Render → Environment.
 VERIFY_TOKEN = os.environ["VERIFY_TOKEN"]
 WHATSAPP_TOKEN = os.environ["WHATSAPP_TOKEN"].strip()
 PHONE_NUMBER_ID = os.environ["PHONE_NUMBER_ID"].strip()
@@ -39,11 +39,26 @@ GEMINI_MODEL = os.environ.get(
 SUPABASE_URL = os.environ["SUPABASE_URL"].strip().rstrip("/")
 SUPABASE_SECRET_KEY = os.environ["SUPABASE_SECRET_KEY"].strip()
 
+BOT_WHATSAPP_NUMBER = os.environ.get(
+    "BOT_WHATSAPP_NUMBER",
+    "15556424478",
+).strip()
+
+if (
+    not BOT_WHATSAPP_NUMBER.isascii()
+    or not BOT_WHATSAPP_NUMBER.isdigit()
+):
+    raise ValueError(
+        "BOT_WHATSAPP_NUMBER must contain country code and digits only"
+    )
+
+BOT_LINK = f"https://wa.me/{BOT_WHATSAPP_NUMBER}?text=Hi"
+
 SESSION_TTL = 1800
 MAX_SESSIONS = 2000
 CONSENT_VERSION = "greeting-flow-v3-auto-card"
 
-# Temporary state for a single server process.
+# Temporary state: run one server process/instance.
 sessions = OrderedDict()
 seen = OrderedDict()
 pending_outbound = {}
@@ -85,13 +100,6 @@ EXPERIENCES = {
         "Do not claim future knowledge.",
     ),
 }
-
-INTRO = (
-    "🎉 Happy New Year 2027! 🥳\n\n"
-    "Who deserves your first smile of the year? 💛\n\n"
-    "Create a personalised New Year wish for someone you love—and turn it "
-    "into a greeting card they’ll be happy to receive."
-)
 
 DATA_NOTICE = (
     "We save your name, choices, WhatsApp number, and the recipient’s "
@@ -156,9 +164,11 @@ def welcome():
             "type": "list",
             "body": {
                 "text": (
-                    "✨ Create a New Year wish for someone special!\n\n"
-                    "Choose an option below. We’ll help you create "
-                    "a personal greeting card to share. 🎁\n\n"
+                    "🎉 Happy New Year 2027!\n\n"
+                    "Make someone you love smile with a personalised "
+                    "New Year wish and greeting card. 💛\n\n"
+                    "Choose an option, tell us who it’s for, and we’ll "
+                    "create a card ready to share! 🎁\n\n"
                     + DATA_NOTICE
                 )
             },
@@ -409,11 +419,10 @@ async def generate_text(state, sender):
 
         state["greeting"] = result
 
-    # Keep this existing database status for renderer/upload retries.
+    # Existing database status retained for image-generation retries.
     state["step"] = "text_ready"
     await save_progress(state, sender)
 
-    # No text greeting or progress message is sent.
     return await make_card(state, sender)
 
 
@@ -542,14 +551,13 @@ async def upload_card(data):
 
 
 async def make_card(state, sender):
-    """Prepare one image response with its forwarding caption."""
+    """Return one image with its combined forwarding caption."""
     if not state.get("greeting"):
         state["step"] = "generating"
         return await generate_text(state, sender)
 
     try:
-        # Compatible with the supplied greeting_card.py.
-        # Its signature parser places "From Name" beneath the greeting.
+        # greeting_card.py handles the background selection and signature.
         data = await asyncio.to_thread(
             render_card,
             signed_greeting(state),
@@ -579,20 +587,22 @@ async def make_card(state, sender):
     state["step"] = "complete"
     await save_progress(state, sender)
 
-    # Exactly one image message; no separate completion text.
     card = {
         "type": "image",
         "image": {
             "id": media_id,
             "caption": (
-                f"Made for {state['recipient_name']}, "
-                f"from {state['sender_name']} 💛\n\n"
-                "Use WhatsApp’s Forward option to send them this card.\n"
-                "Send Hi to create another."
+                f"💛 From {state['sender_name']}, "
+                f"for {state['recipient_name']}—"
+                "a little New Year happiness to share!\n\n"
+                "Forward this card to your loved one.\n\n"
+                "Want to send a wish back or make another? "
+                f"Start here: {BOT_LINK}"
             ),
         },
     }
 
+    # No separate greeting, progress or completion text.
     return [card], state
 
 
@@ -608,11 +618,8 @@ async def reply_for(text, state, number):
         ], None
 
     if command in {"hi", "hello", "menu", "restart"} or state is None:
-        # Exactly two opening messages.
-        return [
-            text_message(INTRO),
-            welcome(),
-        ], {
+        # One starting message, including the experience options.
+        return [welcome()], {
             "step": "experience",
             "updated": time.monotonic(),
         }
@@ -671,16 +678,11 @@ async def reply_for(text, state, number):
 
         if not state.get("sender_name"):
             state["sender_name"] = name
-
-            # Reuse the existing allowed status.
-            # The next question collects the recipient's name.
             state["step"] = "name"
-
             return await checkpoint(state, number)
 
         state["recipient_name"] = name
         state["step"] = "number"
-
         return await checkpoint(state, number)
 
     if step == "number":
@@ -714,7 +716,6 @@ async def reply_for(text, state, number):
             step="generating",
         )
 
-        # Successful saving leads directly to generation and the image.
         return await checkpoint(state, number)
 
     if step == "generating":
@@ -785,9 +786,9 @@ async def send_message(number, content):
 
 async def drain(record, number):
     while record["next"] < len(record["responses"]):
-        response = record["responses"][record["next"]]
+        content = record["responses"][record["next"]]
 
-        if not await send_message(number, response):
+        if not await send_message(number, content):
             return False
 
         record["next"] += 1
@@ -822,7 +823,6 @@ async def process_user(number, messages):
                 if not message_id:
                     continue
 
-                # Retry an already-prepared response before new input.
                 pending = pending_outbound.get(number)
 
                 if pending:
@@ -893,7 +893,7 @@ async def process_user(number, messages):
                     seen.popitem(last=False)
 
     except Exception:
-        # Avoid exposing personal details or secrets in logs.
+        # Do not expose personal details or secrets in logs.
         logger.error(
             "Message processing failed; check configuration and retry."
         )
