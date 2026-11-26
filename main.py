@@ -107,13 +107,8 @@ INTRO = (
     "into a greeting card they’ll be happy to receive."
 )
 
-# DATA_NOTICE = (
-#     "We save your name, choices, WhatsApp number, and the recipient’s "
-#     "name and number. Only share details you have permission to save. "
-#     "Their name goes to Gemini to create the wish; their number does not. "
-#     "You’ll forward the card yourself.\n\n"
-#     "Choose an experience to agree, or send STOP to cancel."
-# )
+
+
 
 
 def text_message(body):
@@ -165,7 +160,7 @@ def welcome():
                     "Choose below. Tell us who it’s for, and we’ll create "
                     "their New Year message and card—ready for you "
                     "to share! 🎁\n\n"
-                    # + DATA_NOTICE
+                    
                 )
             },
             "action": {
