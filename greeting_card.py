@@ -1,5 +1,5 @@
 """Local greeting-card renderer. No external image-generation API."""
-
+import random
 import math
 import re
 from io import BytesIO
@@ -174,11 +174,16 @@ def render_card(
 
     variant = int(variant) % 2
 
+        cards_dir = BASE_DIR / "assets" / "cards"
+
+    backgrounds = sorted(
+        cards_dir.glob(f"theme-{fid}-*.png")
+    )
+
     background_path = (
-        BASE_DIR
-        / "assets"
-        / "cards"
-        / f"theme-{fid}.png"
+        random.choice(backgrounds)
+        if backgrounds
+        else cards_dir / f"theme-{fid}.png"
     )
 
     with Image.open(background_path) as source:
